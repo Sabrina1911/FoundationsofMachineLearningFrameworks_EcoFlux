@@ -1,0 +1,467 @@
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+import streamlit as st
+import joblib
+import re  # NEW: for case-insensitive, pattern-based simplification
+
+# --------------------------------------------------------
+# EcoFlux: A Prompt-Aware Machine Learning Energy Estimator
+# Streamlit GUI
+#
+# This version:
+# - uses the trained regression models (Linear / MLP)
+# - adds a prompt-complexity feature at inference time
+# - recommends a shorter, lower-energy prompt
+# --------------------------------------------------------
+
+# 1. Page configuration
+st.set_page_config(
+    page_title="EcoFlux – Energy Estimator",
+    page_icon="🌿",
+    layout="wide",
+)
+
+# --------------------------------------------------------
+# 2. Helper functions
+# --------------------------------------------------------
+
+@st.cache_resource
+def load_models(models_dir: Path):
+    """
+    Load trained models from the given directory.
+
+    Returns
+    -------
+    lin_model : sklearn LinearRegression
+    mlp_bundle : dict with keys {"scaler", "model"}
+    """
+    lin_path = models_dir / "ecoflux_linear_regression.pkl"
+    mlp_path = models_dir / "ecoflux_mlp_regressor.pkl"
+
+    lin_model = joblib.load(lin_path)
+    mlp_bundle = joblib.load(mlp_path)
+
+    return lin_model, mlp_bundle
+
+
+def classify_sustainability(energy_kwh: float, baseline_kwh: float = 2.0):
+    """
+    Map a numeric energy value to a simple sustainability label.
+    Baseline is used only for the delta, not for the thresholds.
+    """
+    if energy_kwh < 1.5:
+        label = "🟢 Low impact"
+        color = "green"
+    elif energy_kwh < 3.0:
+        label = "🟡 Moderate impact"
+        color = "orange"
+    else:
+        label = "🔴 High impact"
+        color = "red"
+
+    delta = energy_kwh - baseline_kwh
+    return label, color, delta
+
+
+def compute_prompt_features(prompt: str):
+    """
+    Compute simple prompt-complexity features from raw text.
+
+    Parameters
+    ----------
+    prompt : str
+        User-entered prompt.
+
+    Returns
+    -------
+    token_count : int
+        Number of whitespace-separated tokens.
+    line_count : int
+        Number of non-empty lines.
+    complexity_score : float
+        Normalised score (roughly 0–1) based on length and density.
+    """
+    # Split on whitespace for a simple token approximation
+    tokens = prompt.split()
+    token_count = len(tokens)
+
+    # Count non-empty lines
+    lines = [ln for ln in prompt.splitlines() if ln.strip()]
+    line_count = max(1, len(lines))  # avoid divide-by-zero
+
+    # Average tokens per non-empty line
+    avg_tokens_per_line = token_count / line_count
+
+    # Normalise into a 0–1 band (cap at typical classroom prompt sizes)
+    # 0  tokens -> 0.0, 200+ tokens -> ~1.0
+    length_component = min(1.0, token_count / 200.0)
+    density_component = min(1.0, avg_tokens_per_line / 40.0)
+
+    # Simple average of the two components
+    complexity_score = 0.5 * (length_component + density_component)
+
+    return token_count, line_count, complexity_score
+
+
+def suggest_simpler_prompt(prompt: str, max_tokens: int = 80):
+    """
+    Create a shorter version of the prompt using simple heuristics.
+
+    Cases:
+    - Empty / whitespace-only: return as-is
+    - Very short prompts (<= 10 tokens): return as-is
+    - Long 'Role: / Context: / Expectation: / Final task:' prompts:
+        -> return a concise, hand-crafted template preserving intent
+    - Other prompts:
+        -> remove filler phrases + clip to max_tokens with ellipsis
+    """
+    # Normalise whitespace
+    cleaned = " ".join(prompt.strip().split())
+
+    if not cleaned:
+        return cleaned
+
+    # Tokenise once for basic length decisions
+    tokens = cleaned.split()
+    token_count = len(tokens)
+
+    # --- 1) Very short prompts: don't touch them ---
+    if token_count <= 10:
+        return cleaned
+
+    # --- 2) Special handling for long Role/Context/Expectation style prompts ---
+    has_role = "Role:" in cleaned
+    has_context = "Context:" in cleaned
+
+    if has_role and has_context and token_count > max_tokens:
+        # Extract the first sentence from the Role: section, if possible
+        try:
+            role_start = cleaned.index("Role:")
+            # From "Role:" to the end
+            role_fragment = cleaned[role_start:]
+            # Cut at the first period
+            dot_idx = role_fragment.find(".")
+            if dot_idx != -1:
+                role_sentence = role_fragment[: dot_idx + 1]
+            else:
+                role_sentence = role_fragment
+        except ValueError:
+            # Fallback: if indexing fails, just keep a generic role sentence
+            role_sentence = "Role: You are a sustainability-focused AI assistant."
+
+        simplified = (
+            f"{role_sentence} "
+            "Context: Summarise how large language models affect energy use, carbon footprint, "
+            "and sustainability. "
+            "Expectation: Explain trade-offs between model performance and compute cost, and "
+            "mention renewable energy, efficient hardware, and responsible AI practices. "
+            "Final task: End with 3–4 bullet-point takeaways linked to modern sustainability goals."
+        )
+
+        # Clean up any extra spaces
+        return " ".join(simplified.split())
+
+    # --- 3) Generic simplification for other (non-template) prompts ---
+    # Remove / compress verbose phrases (case-insensitive)
+    filler_phrases = [
+        "please write in detail about",
+        "please provide a detailed explanation of",
+        "in as much detail as possible",
+        "you are an expert",
+        "act as an expert",
+        "suitable for beginners",
+        "suitable for beginner readers",
+        "keep the explanation simple and clear",
+        "keep it simple and clear",
+        "in simple and clear language",
+        "in one sentence",
+        "in a single sentence",
+        "highly detailed",
+        "deeply detailed",
+        "multi-paragraph explanation",
+        "highly structured",
+    ]
+
+    for phrase in filler_phrases:
+        cleaned = re.sub(re.escape(phrase), "", cleaned, flags=re.IGNORECASE)
+
+    # Special compression examples
+    cleaned = re.sub(
+        r"\btwo examples suitable for beginners\b",
+        "two simple examples",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = re.sub(
+        r"\bprovide a highly detailed, multi-paragraph explanation\b",
+        "provide a clear explanation",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Normalise whitespace again after removals
+    cleaned = " ".join(cleaned.split())
+    tokens = cleaned.split()
+    token_count = len(tokens)
+
+    # If still short enough, return as-is
+    if token_count <= max_tokens:
+        return cleaned
+
+    # Otherwise clip to max_tokens and add ellipsis
+    shortened = " ".join(tokens[:max_tokens]) + " ..."
+    return shortened
+
+def prompt_scaling_factor(token_count: int) -> float:
+    """
+    Map token count into a multiplicative energy scaling factor.
+
+    - <= 8 tokens   -> 1.00  (no extra cost)
+    - 9–20 tokens   -> 1.05  (+5% energy)
+    - > 20 tokens   -> 1.10  (+10% energy)
+    """
+    if token_count <= 8:
+        return 1.00
+    elif token_count <= 20:
+        return 1.05
+    else:
+        return 1.10
+
+# --------------------------------------------------------
+# 3. Load models
+# --------------------------------------------------------
+
+MODELS_DIR = Path("models")
+
+try:
+    lin_model, mlp_bundle = load_models(MODELS_DIR)
+    mlp_scaler = mlp_bundle["scaler"]
+    mlp_model = mlp_bundle["model"]
+    models_loaded = True
+except Exception as e:
+    st.error(f"❌ Could not load models from {MODELS_DIR}: {e}")
+    models_loaded = False
+    lin_model = None
+    mlp_scaler = None
+    mlp_model = None
+
+# --------------------------------------------------------
+# 4. Sidebar – model choice & info
+# --------------------------------------------------------
+
+st.sidebar.title("EcoFlux Settings")
+st.sidebar.markdown(
+    "Select which trained model EcoFlux should use for **base energy** predictions."
+)
+
+model_choice = st.sidebar.radio(
+    "Choose prediction model:",
+    ("Linear Regression (recommended)", "MLPRegressor (neural network)"),
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    "**About EcoFlux**  \n"
+    "EcoFlux estimates the energy usage (kWh) of an ML training run based on:\n"
+    "- model depth (layers)\n"
+    "- training duration (hours)\n"
+    "- compute intensity (GFLOPs/hour)\n"
+    "- prompt length / complexity (prototype)\n\n"
+    "It is an **educational tool**, not a precise carbon accounting system."
+)
+
+# --------------------------------------------------------
+# 5. Main layout – title and description
+# --------------------------------------------------------
+
+st.title("🌿 EcoFlux: Machine Learning Energy Estimator")
+st.caption("Making machine learning greener through transparency.")
+
+st.markdown(
+    """
+EcoFlux helps you explore how **model design choices** and **prompt length**
+affect estimated training energy consumption.  
+Enter a prompt, adjust the sliders, and see both the original energy estimate
+and a recommended lower-energy prompt.
+"""
+)
+
+st.markdown("---")
+
+# Two equal-width columns: left (inputs) and right (results)
+col_left, col_right = st.columns([1, 1])
+
+# --------------------------------------------------------
+# 6. Left column – prompt + numeric inputs
+# --------------------------------------------------------
+
+with col_left:
+    st.subheader("Prompt and Model Configuration")
+
+    prompt_text = st.text_area(
+        "Enter your LLM prompt here:",
+        value=(
+            "Role: You are a sustainability-focused ML assistant.\n"
+            "Context: Explain the trade-offs between model size and energy use.\n"
+            "Expectation: Give 3 concise bullet points suitable for students."
+        ),
+        height=200,
+        help="This is the text the LLM would receive as input.",
+    )
+
+    num_layers = st.slider(
+        "Number of layers",
+        min_value=2,
+        max_value=24,
+        value=8,
+        step=1,
+        help="Approximate depth of the model.",
+    )
+
+    training_hours = st.slider(
+        "Training duration (hours)",
+        min_value=0.5,
+        max_value=24.0,
+        value=6.0,
+        step=0.5,
+        help="How long the model is trained.",
+    )
+
+    flops_per_hour = st.slider(
+        "Compute intensity (GFLOPs/hour)",
+        min_value=10.0,
+        max_value=300.0,
+        value=120.0,
+        step=5.0,
+        help="Approximate computation per hour.",
+    )
+
+    st.markdown("")
+    predict_button = st.button("Predict Energy & Recommend Prompt", type="primary")
+
+# --------------------------------------------------------
+# 7. Right column – predictions, recommendation & comparison
+# --------------------------------------------------------
+
+with col_right:
+    st.subheader("Energy & Sustainability")
+
+    if not models_loaded:
+        st.warning("Models are not loaded. Please check the models directory.")
+    elif not predict_button:
+        st.info(
+            "Enter a prompt, adjust the parameters on the left, "
+            "and click **Predict Energy & Recommend Prompt**."
+        )
+    else:
+        # -------- 7.1 Base energy from numeric model --------
+        X_input = np.array([[num_layers, training_hours, flops_per_hour]])
+
+        if model_choice.startswith("Linear"):
+            base_energy = lin_model.predict(X_input)[0]
+            model_used = "Linear Regression"
+        else:
+            X_scaled = mlp_scaler.transform(X_input)
+            base_energy = mlp_model.predict(X_scaled)[0]
+            model_used = "MLPRegressor"
+
+        base_energy = max(0.0, float(base_energy))
+
+        # Baseline reference configuration (e.g., 8 layers, 6h, 120 GFLOPs/h)
+        baseline_X = np.array([[8, 6.0, 120.0]])
+        baseline_energy = lin_model.predict(baseline_X)[0]
+        baseline_energy = max(0.0, float(baseline_energy))
+
+        # -------- 7.2 Original prompt complexity & energy --------
+        orig_tokens, orig_lines, orig_complexity = compute_prompt_features(prompt_text)
+        orig_scale = prompt_scaling_factor(orig_tokens)
+        orig_total_energy = base_energy * orig_scale
+        orig_overhead = orig_total_energy - base_energy  # how much extra due to prompt
+
+        # -------- 7.3 Recommended simpler prompt --------
+        improved_prompt = suggest_simpler_prompt(prompt_text)
+        imp_tokens, imp_lines, imp_complexity = compute_prompt_features(improved_prompt)
+        imp_scale = prompt_scaling_factor(imp_tokens)
+        imp_total_energy = base_energy * imp_scale
+        imp_overhead = imp_total_energy - base_energy
+
+        saving_kwh = orig_total_energy - imp_total_energy
+
+        # -------- 7.4 Sustainability classification (original prompt) --------
+        label, color, delta_vs_baseline = classify_sustainability(
+            orig_total_energy, baseline_energy
+        )
+
+        # Main metric for original prompt
+        st.metric(
+            label="Original prompt energy estimate (kWh)",
+            value=f"{orig_total_energy:.2f}",
+            delta=f"{delta_vs_baseline:+.2f} kWh vs baseline",
+        )
+
+        st.markdown(
+            f"**Sustainability rating:** "
+            f"<span style='color:{color}; font-weight:bold;'>{label}</span>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(f"*Base model used for estimation: **{model_used}***")
+
+        # -------- 7.5 Comparison table --------
+        comparison_df = pd.DataFrame(
+            {
+                "Variant": ["Original prompt", "Recommended prompt"],
+                "Tokens": [orig_tokens, imp_tokens],
+                "Lines": [orig_lines, imp_lines],
+                "Complexity score (0–1)": [
+                    round(orig_complexity, 3),
+                    round(imp_complexity, 3),
+                ],
+                "Prompt overhead (kWh)": [
+                    round(orig_overhead, 3),
+                    round(imp_overhead, 3),
+                ],
+                "Total energy (kWh)": [
+                    round(orig_total_energy, 3),
+                    round(imp_total_energy, 3),
+                ],
+            }
+        )
+
+        st.markdown("#### Original vs Recommended Prompt (Energy Comparison)")
+        st.dataframe(comparison_df, use_container_width=True)
+
+        if saving_kwh > 0:
+            st.success(
+                f"By using the recommended prompt, EcoFlux estimates a saving of "
+                f"**{saving_kwh:.2f} kWh** for this configuration."
+            )
+        else:
+            st.info(
+                "The recommended prompt is already very concise — "
+                "no additional energy savings are estimated."
+            )
+
+        # -------- 7.6 Show both prompts for inspection --------
+        with st.expander("🔎 View prompts"):
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                st.markdown("**Original prompt**")
+                st.code(prompt_text, language="markdown")
+            with col_p2:
+                st.markdown("**Recommended lower-energy prompt**")
+                st.code(improved_prompt, language="markdown")
+
+        st.markdown(
+            """
+**Quick Tips:**
+
+- Shorter, clearer prompts usually reduce token count and energy overhead.  
+- Keeping role/context focused and avoiding repetition helps both clarity and sustainability.  
+- Model-side choices (layers, hours, FLOPs/hour) and prompt design *together*
+  determine the final energy estimate.
+"""
+        )
