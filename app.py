@@ -217,18 +217,24 @@ def suggest_simpler_prompt(prompt: str, max_tokens: int = 80):
 
 def prompt_scaling_factor(token_count: int) -> float:
     """
-    Map token count into a multiplicative energy scaling factor.
-
-    - <= 8 tokens   -> 1.00  (no extra cost)
-    - 9–20 tokens   -> 1.05  (+5% energy)
-    - > 20 tokens   -> 1.10  (+10% energy)
+    More granular scaling:
+    - <= 20 tokens    -> 1.00  (no extra cost)
+    - 21–60 tokens    -> 1.05  (+5% energy)
+    - 61–120 tokens   -> 1.10  (+10% energy)
+    - 121–200 tokens  -> 1.15  (+15% energy)
+    - > 200 tokens    -> 1.20  (+20% energy)
     """
-    if token_count <= 8:
+    if token_count <= 20:
         return 1.00
-    elif token_count <= 20:
+    elif token_count <= 60:
         return 1.05
-    else:
+    elif token_count <= 120:
         return 1.10
+    elif token_count <= 200:
+        return 1.15
+    else:
+        return 1.20
+
 
 # --------------------------------------------------------
 # 3. Load models
