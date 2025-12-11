@@ -78,9 +78,11 @@ The interface supports:
 
 cd C:\Users\user\1557_VSC\MLF_MVP
 ..venv_ecoflux\Scripts\Activate.ps1
+pip install -r requiremnets.txt
 
 ### 2. Run the GUI
 
+streamlit run app.py
 The browser will open automatically.
 
 ### Generate synthetic dataset
@@ -150,12 +152,4 @@ EcoFlux can be upgraded with:
 - Embedding-based semantic prompt rewriting  
 - Deployment as a web API  
 
-## License
 
-This project is for **educational purposes only**  
-Not intended for real-world carbon accounting.
-
-If you want, I can also generate:
-
-- `RUN.md`  
-- `CONTRIBUTING.md`  

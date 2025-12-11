@@ -4,6 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 import joblib
+import matplotlib.pyplot as plt  # NEW: for baseline energy curve plot
 import re  # NEW: for case-insensitive, pattern-based simplification
 
 # --------------------------------------------------------
@@ -44,6 +45,15 @@ def load_models(models_dir: Path):
     mlp_bundle = joblib.load(mlp_path)
 
     return lin_model, mlp_bundle
+
+@st.cache_data
+def load_energy_data(csv_path: Path) -> pd.DataFrame:
+    """
+    Load the synthetic energy dataset used for training the regression model.
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {csv_path}")
+    return pd.read_csv(csv_path)
 
 
 def classify_sustainability(energy_kwh: float, baseline_kwh: float = 2.0):
@@ -217,24 +227,28 @@ def suggest_simpler_prompt(prompt: str, max_tokens: int = 80):
 
 def prompt_scaling_factor(token_count: int) -> float:
     """
-    More granular scaling:
-    - <= 20 tokens    -> 1.00  (no extra cost)
-    - 21–60 tokens    -> 1.05  (+5% energy)
-    - 61–120 tokens   -> 1.10  (+10% energy)
-    - 121–200 tokens  -> 1.15  (+15% energy)
-    - > 200 tokens    -> 1.20  (+20% energy)
+    High granularity scaling: 10 buckets
     """
-    if token_count <= 20:
+    if token_count <= 10:
         return 1.00
+    elif token_count <= 20:
+        return 1.02
+    elif token_count <= 40:
+        return 1.04
     elif token_count <= 60:
-        return 1.05
-    elif token_count <= 120:
+        return 1.06
+    elif token_count <= 80:
+        return 1.08
+    elif token_count <= 100:
         return 1.10
-    elif token_count <= 200:
-        return 1.15
+    elif token_count <= 140:
+        return 1.12
+    elif token_count <= 180:
+        return 1.14
+    elif token_count <= 240:
+        return 1.17
     else:
         return 1.20
-
 
 # --------------------------------------------------------
 # 3. Load models
@@ -248,7 +262,7 @@ try:
     mlp_model = mlp_bundle["model"]
     models_loaded = True
 except Exception as e:
-    st.error(f"❌ Could not load models from {MODELS_DIR}: {e}")
+    st.error(f" Could not load models from {MODELS_DIR}: {e}")
     models_loaded = False
     lin_model = None
     mlp_scaler = None
@@ -307,16 +321,33 @@ col_left, col_right = st.columns([1, 1])
 with col_left:
     st.subheader("Prompt and Model Configuration")
 
-    prompt_text = st.text_area(
+    default_prompt = (
+        "Role: You are a sustainability-focused ML assistant.\n"
+        "Context: Explain the trade-offs between model size and energy use.\n"
+        "Expectation: Give 3 concise bullet points suitable for students."
+    )
+
+    # Initialise once
+    if "prompt_input" not in st.session_state:
+        st.session_state.prompt_input = default_prompt
+
+    # Callback used by the clear button
+    def clear_prompt():
+        st.session_state.prompt_input = ""
+
+    # Text area is fully controlled by session_state
+    st.text_area(
         "Enter your LLM prompt here:",
-        value=(
-            "Role: You are a sustainability-focused ML assistant.\n"
-            "Context: Explain the trade-offs between model size and energy use.\n"
-            "Expectation: Give 3 concise bullet points suitable for students."
-        ),
+        key="prompt_input",
         height=200,
         help="This is the text the LLM would receive as input.",
     )
+
+    # Clear / eraser button – uses callback
+    st.button("Clear prompt", on_click=clear_prompt)
+
+    # For later calculations, read from session_state
+    prompt_text = st.session_state.prompt_input
 
     num_layers = st.slider(
         "Number of layers",
@@ -326,7 +357,7 @@ with col_left:
         step=1,
         help="Approximate depth of the model.",
     )
-
+        
     training_hours = st.slider(
         "Training duration (hours)",
         min_value=0.5,
@@ -463,11 +494,134 @@ with col_right:
 
         st.markdown(
             """
-**Quick Tips:**
+            **Quick Tips:**
 
-- Shorter, clearer prompts usually reduce token count and energy overhead.  
-- Keeping role/context focused and avoiding repetition helps both clarity and sustainability.  
-- Model-side choices (layers, hours, FLOPs/hour) and prompt design *together*
-  determine the final energy estimate.
-"""
-        )
+            - Shorter, clearer prompts usually reduce token count and energy overhead.  
+            - Keeping role/context focused and avoiding repetition helps both clarity and sustainability.  
+            - Model-side choices (layers, hours, FLOPs/hour) and prompt design *together*
+            determine the final energy estimate.
+            """
+                    )
+
+                # -------- 7.6 Baseline energy curve + prompt-specific markers --------
+        try:
+            data_path = Path("data/energy_synthetic.csv")
+            df_energy = load_energy_data(data_path)
+
+            # Features and actual target from synthetic dataset
+            X_all = df_energy[["num_layers", "training_hours", "flops_per_hour"]]
+            y_actual_all = df_energy["energy_kwh"].values
+
+            fig, ax = plt.subplots()
+
+            if model_choice.startswith("Linear"):
+                # ----- LINEAR REGRESSION VIEW: Actual vs Predicted -----
+                y_pred_all = lin_model.predict(X_all)
+
+                # Scatter of all data points: x = actual, y = predicted (blue)
+                ax.scatter(
+                    y_actual_all,
+                    y_pred_all,
+                    alpha=0.6,
+                    color="#4C72B0",   # blue
+                    label="Data points",
+                )
+
+                # Best-fit line in (actual, predicted) space
+                m, b = np.polyfit(y_actual_all, y_pred_all, 1)
+                x_line = np.linspace(y_actual_all.min(), y_actual_all.max(), 100)
+                y_line = m * x_line + b
+                ax.plot(
+                    x_line,
+                    y_line,
+                    color="#4C72B0",
+                    linewidth=2,
+                    label="Linear regression best-fit line",
+                )
+
+                # For the current configuration:
+                # treat base_energy as "actual-ish" baseline x value
+                x_cfg = base_energy
+
+                # Original prompt energy (orange diamond)
+                ax.scatter(
+                    x_cfg,
+                    orig_total_energy,
+                    marker="D",
+                    s=90,
+                    color="#F28E2B",          # orange
+                    edgecolors="black",
+                    linewidth=0.8,
+                    label="Original prompt energy",
+                    zorder=5,
+                )
+
+                # Recommended prompt energy (green square)
+                ax.scatter(
+                    x_cfg,
+                    imp_total_energy,
+                    marker="s",
+                    s=90,
+                    color="#59A14F",          # green
+                    edgecolors="black",
+                    linewidth=0.8,
+                    label="Recommended prompt energy",
+                    zorder=5,
+                )
+
+                # ----- Correct dashed guides (actual -> model prediction) -----
+                # Model prediction (no prompt scaling) for this config
+                y_cfg_pred = lin_model.predict(
+                    np.array([[num_layers, training_hours, flops_per_hour]])
+                )[0]
+
+                ax.vlines(
+                    x_cfg,
+                    0,
+                    y_cfg_pred,
+                    linestyles=":",
+                    linewidth=1,
+                    color="gray",
+                )
+                ax.hlines(
+                    y_cfg_pred,
+                    0,
+                    x_cfg,
+                    linestyles=":",
+                    linewidth=1,
+                    color="gray",
+                )
+
+                ax.set_xlabel("Actual energy (kWh)")
+                ax.set_ylabel("Predicted / prompt-adjusted energy (kWh)")
+                ax.set_title("Linear Regression: Actual vs Predicted Energy")
+
+            else:
+                # ----- MLP VIEW (simple actual vs predicted scatter for now) -----
+                X_scaled_all = mlp_scaler.transform(X_all)
+                y_pred_all = mlp_model.predict(X_scaled_all)
+
+                ax.scatter(
+                    y_actual_all,
+                    y_pred_all,
+                    alpha=0.6,
+                    color="#4C72B0",
+                    label="MLP predictions",
+                )
+
+                ax.set_xlabel("Actual energy (kWh)")
+                ax.set_ylabel("Predicted energy (kWh)")
+                ax.set_title("MLPRegressor: Actual vs Predicted Energy")
+
+            ax.set_ylim(bottom=0)
+            ax.set_xlim(left=0)
+            ax.legend(loc="upper left", frameon=True)  # move legend to corner
+
+            st.markdown("#### Energy Curve and Prompt-Specific Estimates")
+            st.pyplot(fig)
+
+        except Exception as e:
+            st.info(f"Could not draw energy curve from synthetic dataset: {e}")
+
+
+
