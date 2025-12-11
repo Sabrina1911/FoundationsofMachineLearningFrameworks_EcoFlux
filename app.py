@@ -502,126 +502,220 @@ with col_right:
             determine the final energy estimate.
             """
                     )
-
-                # -------- 7.6 Baseline energy curve + prompt-specific markers --------
+                        # -------- 7.6 Model visualisation + prompt-specific markers --------
         try:
             data_path = Path("data/energy_synthetic.csv")
             df_energy = load_energy_data(data_path)
 
-            # Features and actual target from synthetic dataset
+            # Common: features and actual target from synthetic dataset
             X_all = df_energy[["num_layers", "training_hours", "flops_per_hour"]]
             y_actual_all = df_energy["energy_kwh"].values
 
-            fig, ax = plt.subplots()
-
+            # ----- LINEAR REGRESSION VIEW: 2D actual vs predicted -----
             if model_choice.startswith("Linear"):
-                # ----- LINEAR REGRESSION VIEW: Actual vs Predicted -----
                 y_pred_all = lin_model.predict(X_all)
 
-                # Scatter of all data points: x = actual, y = predicted (blue)
+                # Create 2D figure/axis
+                fig, ax = plt.subplots()
+
+                # DATA POINTS — more visible (alpha=0.75)
                 ax.scatter(
                     y_actual_all,
                     y_pred_all,
-                    alpha=0.6,
-                    color="#4C72B0",   # blue
+                    alpha=0.75,
+                    color="#4C72B0",
                     label="Data points",
                 )
 
-                # Best-fit line in (actual, predicted) space
+                # BEST-FIT LINE (orange)
                 m, b = np.polyfit(y_actual_all, y_pred_all, 1)
                 x_line = np.linspace(y_actual_all.min(), y_actual_all.max(), 100)
                 y_line = m * x_line + b
                 ax.plot(
                     x_line,
                     y_line,
-                    color="#4C72B0",
+                    color="#F28E2B",
                     linewidth=2,
                     label="Linear regression best-fit line",
                 )
 
-                # For the current configuration:
-                # treat base_energy as "actual-ish" baseline x value
+                # Current configuration: treat base_energy as "actual-ish" x
                 x_cfg = base_energy
 
-                # Original prompt energy (orange diamond)
+                # ORIGINAL PROMPT (purple diamond)
                 ax.scatter(
                     x_cfg,
                     orig_total_energy,
                     marker="D",
-                    s=90,
-                    color="#F28E2B",          # orange
+                    s=120,
+                    color="#9467BD",
                     edgecolors="black",
-                    linewidth=0.8,
+                    linewidth=1,
                     label="Original prompt energy",
-                    zorder=5,
+                    zorder=6,
                 )
 
-                # Recommended prompt energy (green square)
+                # RECOMMENDED PROMPT (red square)
                 ax.scatter(
                     x_cfg,
                     imp_total_energy,
                     marker="s",
-                    s=90,
-                    color="#59A14F",          # green
+                    s=120,
+                    color="#D62728",
                     edgecolors="black",
-                    linewidth=0.8,
+                    linewidth=1,
                     label="Recommended prompt energy",
-                    zorder=5,
+                    zorder=6,
                 )
 
-                # ----- Correct dashed guides (actual -> model prediction) -----
-                # Model prediction (no prompt scaling) for this config
-                y_cfg_pred = lin_model.predict(
-                    np.array([[num_layers, training_hours, flops_per_hour]])
-                )[0]
+                # Make sure axes start at 0
+                ax.set_xlim(left=0)
+                ax.set_ylim(bottom=0)
 
+                # ----- RECOMMENDED POINT DASHED GUIDES (TO AXES) -----
                 ax.vlines(
                     x_cfg,
-                    0,
-                    y_cfg_pred,
+                    ymin=0,                 # from x-axis (0 on y)
+                    ymax=imp_total_energy,
                     linestyles=":",
-                    linewidth=1,
-                    color="gray",
+                    linewidth=1.2,
+                    color="#6E6E6E",
                 )
                 ax.hlines(
-                    y_cfg_pred,
-                    0,
-                    x_cfg,
+                    imp_total_energy,
+                    xmin=0,                 # from y-axis (0 on x)
+                    xmax=x_cfg,
                     linestyles=":",
-                    linewidth=1,
-                    color="gray",
+                    linewidth=1.2,
+                    color="#6E6E6E",
                 )
 
                 ax.set_xlabel("Actual energy (kWh)")
                 ax.set_ylabel("Predicted / prompt-adjusted energy (kWh)")
                 ax.set_title("Linear Regression: Actual vs Predicted Energy")
+                ax.legend(loc="upper left", frameon=True)
 
+            # ----- MLP VIEW: 3D non-linear surface over (layers, FLOPs) -----
             else:
-                # ----- MLP VIEW (simple actual vs predicted scatter for now) -----
-                X_scaled_all = mlp_scaler.transform(X_all)
-                y_pred_all = mlp_model.predict(X_scaled_all)
+                # Grid ranges
+                layers_vals = np.linspace(
+                    df_energy["num_layers"].min(),
+                    df_energy["num_layers"].max(),
+                    20,
+                )
+                flops_vals = np.linspace(
+                    df_energy["flops_per_hour"].min(),
+                    df_energy["flops_per_hour"].max(),
+                    20,
+                )
+                L_grid, F_grid = np.meshgrid(layers_vals, flops_vals)
 
-                ax.scatter(
-                    y_actual_all,
-                    y_pred_all,
-                    alpha=0.6,
-                    color="#4C72B0",
-                    label="MLP predictions",
+                # Build grid for prediction
+                X_grid = np.column_stack([
+                    L_grid.ravel(),
+                    np.full_like(L_grid.ravel(), training_hours),
+                    F_grid.ravel(),
+                ])
+                X_grid_scaled = mlp_scaler.transform(X_grid)
+                Z_pred = mlp_model.predict(X_grid_scaled).reshape(L_grid.shape)
+
+                # Slightly smaller figure
+                fig = plt.figure(figsize=(5, 4))
+                ax = fig.add_subplot(111, projection="3d")
+
+                # Pull the camera back to avoid cut-off
+                ax.view_init(elev=25, azim=135)
+
+                # -------------------------------------------------------
+                # 3D SURFACE — transparent + lighter (MAIN FIX)
+                # -------------------------------------------------------
+                ax.plot_surface(
+                    L_grid,
+                    F_grid,
+                    Z_pred,
+                    cmap="cividis",      # cleaner & lighter colormap (optional)
+                    alpha=0.45,          # MUCH lighter so markers remain visible
+                    linewidth=0,
+                    antialiased=True,
                 )
 
-                ax.set_xlabel("Actual energy (kWh)")
-                ax.set_ylabel("Predicted energy (kWh)")
-                ax.set_title("MLPRegressor: Actual vs Predicted Energy")
+                # Scatter real synthetic points
+                ax.scatter(
+                    df_energy["num_layers"],
+                    df_energy["flops_per_hour"],
+                    df_energy["energy_kwh"],
+                    color="#4C72B0",
+                    alpha=0.45,
+                    s=15,
+                    label="Observed energy (synthetic)",
+                )
 
-            ax.set_ylim(bottom=0)
-            ax.set_xlim(left=0)
-            ax.legend(loc="upper left", frameon=True)  # move legend to corner
+                # -------------------------------------------------------
+                # Current config markers — easier to see
+                # -------------------------------------------------------
+                ax.scatter(
+                    num_layers,
+                    flops_per_hour,
+                    orig_total_energy,
+                    marker="D",
+                    s=100,                 # larger for visibility
+                    color="#9467BD",
+                    edgecolors="black",
+                    linewidth=1,
+                    label="Original prompt energy",
+                    zorder=10,
+                )
+                ax.scatter(
+                    num_layers,
+                    flops_per_hour,
+                    imp_total_energy,
+                    marker="s",
+                    s=100,
+                    color="#D62728",
+                    edgecolors="black",
+                    linewidth=1,
+                    label="Recommended prompt energy",
+                    zorder=10,
+                )
 
+                # Axis padding so nothing is cropped
+                ax.set_xlim(
+                    df_energy["num_layers"].min() - 1,
+                    df_energy["num_layers"].max() + 1,
+                )
+                ax.set_ylim(
+                    df_energy["flops_per_hour"].min() - 20,
+                    df_energy["flops_per_hour"].max() + 20,
+                )
+
+                z_min = min(
+                    df_energy["energy_kwh"].min(),
+                    Z_pred.min(),
+                    orig_total_energy,
+                    imp_total_energy,
+                )
+                z_max = max(
+                    df_energy["energy_kwh"].max(),
+                    Z_pred.max(),
+                    orig_total_energy,
+                    imp_total_energy,
+                )
+                ax.set_zlim(z_min - 0.4, z_max + 0.6)
+
+                # Labels & title
+                ax.set_xlabel("Number of layers")
+                ax.set_ylabel("Compute intensity\n(GFLOPs/h)", labelpad=8)
+                ax.set_zlabel("Predicted / prompt-adjusted energy (kWh)")
+                ax.set_title(
+                    "MLPRegressor: Non-linear Energy Surface\n"
+                    f"(training_hours fixed at {training_hours:.1f} h)"
+                )
+                ax.legend(loc="upper left")
+
+            # Common Streamlit rendering
             st.markdown("#### Energy Curve and Prompt-Specific Estimates")
+            fig.tight_layout(pad=0.5)
             st.pyplot(fig)
 
         except Exception as e:
             st.info(f"Could not draw energy curve from synthetic dataset: {e}")
-
-
-
