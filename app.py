@@ -74,6 +74,74 @@ def classify_sustainability(energy_kwh: float, baseline_kwh: float = 2.0):
     delta = energy_kwh - baseline_kwh
     return label, color, delta
 
+def load_iso_model(models_dir: Path):
+    """
+    Load the pre-trained IsolationForest model for anomaly detection.
+    The model should be trained offline and saved as a .pkl file.
+    """
+    iso_path = models_dir / "ecoflux_iso_forest.pkl"
+    iso_model = joblib.load(iso_path)
+    return iso_model
+
+
+def classify_anomaly(
+    num_layers: float,
+    training_hours: float,
+    flops_per_hour: float,
+    base_energy: float,
+    iso_model,
+    score_threshold_warn: float = -0.4,
+):
+    """
+    Use IsolationForest to classify whether the current configuration
+    is normal, unusual, or anomalous.
+
+    Parameters
+    ----------
+    num_layers : float
+        Model depth (layers).
+    training_hours : float
+        Training duration in hours.
+    flops_per_hour : float
+        Compute intensity in GFLOPs/hour.
+    base_energy : float
+        Base energy prediction (kWh) from the regression model.
+        Include this only if the IsolationForest was trained with energy.
+    iso_model :
+        Fitted IsolationForest instance loaded from disk.
+    score_threshold_warn : float
+        Threshold on the anomaly score to flag "unusual" cases.
+
+    Returns
+    -------
+    status_text : str
+        Human-readable anomaly status.
+    status_color : str
+        Color name for UI (e.g., 'green', 'orange', 'red').
+    score : float
+        Raw anomaly score (higher = more normal, lower = more anomalous).
+    """
+    # IMPORTANT: The feature order and dimensionality must match
+    # how you trained the IsolationForest offline.
+    # Example: 4 features [num_layers, training_hours, flops_per_hour, base_energy]
+    X_input_iso = np.array([[num_layers, training_hours, flops_per_hour, base_energy]])
+
+    pred_label = iso_model.predict(X_input_iso)[0]      # 1 = normal, -1 = anomaly
+    score = iso_model.score_samples(X_input_iso)[0]     # higher = more normal
+
+    if pred_label == -1:
+        status_text = "🔴 Anomalous configuration (out-of-distribution)"
+        status_color = "red"
+    else:
+        # "Normal but unusual" vs "normal and typical"
+        if score < score_threshold_warn:
+            status_text = "🟡 Unusual but not critical"
+            status_color = "orange"
+        else:
+            status_text = "🟢 Normal configuration"
+            status_color = "green"
+
+    return status_text, status_color, score
 
 def compute_prompt_features(prompt: str):
     """
@@ -94,8 +162,14 @@ def compute_prompt_features(prompt: str):
         Normalised score (roughly 0–1) based on length and density.
     """
     # Split on whitespace for a simple token approximation
-    tokens = prompt.split()
-    token_count = len(tokens)
+    word_tokens = prompt.split()
+    word_token_count = len(word_tokens)
+
+    # newline tokens: count each '\n' as one extra token
+    newline_count = prompt.count("\n")
+
+    # Final token count
+    token_count = word_token_count + newline_count
 
     # Count non-empty lines
     lines = [ln for ln in prompt.splitlines() if ln.strip()]
@@ -107,10 +181,12 @@ def compute_prompt_features(prompt: str):
     # Normalise into a 0–1 band (cap at typical classroom prompt sizes)
     # 0  tokens -> 0.0, 200+ tokens -> ~1.0
     length_component = min(1.0, token_count / 200.0)
-    density_component = min(1.0, avg_tokens_per_line / 40.0)
+    complexity_score = length_component
+
+    # density_component = min(1.0, avg_tokens_per_line / 40.0)
 
     # Simple average of the two components
-    complexity_score = 0.5 * (length_component + density_component)
+    # complexity_score = 0.5 * (length_component + density_component)
 
     return token_count, line_count, complexity_score
 
@@ -249,6 +325,32 @@ def prompt_scaling_factor(token_count: int) -> float:
         return 1.17
     else:
         return 1.20
+    
+def prompt_overhead_kwh(token_count: int, complexity: float) -> float:
+    """
+    Estimate additional energy overhead (in kWh) due to prompt length/complexity.
+
+    Parameters
+    ----------
+    token_count : int
+        Number of whitespace-separated tokens in the prompt.
+    complexity : float
+        Complexity score in [0, 1] from compute_prompt_features.
+
+    Returns
+    -------
+    overhead_kwh : float
+        Estimated extra energy in kWh.
+    """
+    # Base energy cost per token in kWh (tunable hyperparameter)
+    base_per_token = 0.01  # e.g., 0.003 kWh per token
+
+    # Complexity amplifies or shrinks overhead:
+    # complexity 0.0 -> factor ~0.5, complexity 1.0 -> factor ~1.5
+    complexity_factor = 1.0 + complexity
+
+    overhead_kwh = token_count * base_per_token * complexity_factor
+    return overhead_kwh
 
 # --------------------------------------------------------
 # 3. Load models
@@ -397,33 +499,41 @@ with col_right:
         # -------- 7.1 Base energy from numeric model --------
         X_input = np.array([[num_layers, training_hours, flops_per_hour]])
 
+        # ✅ LinearRegression: use raw (unscaled) features
+        # ✅ MLPRegressor: use scaled features (mlp_scaler)
         if model_choice.startswith("Linear"):
-            base_energy = lin_model.predict(X_input)[0]
+            base_energy_raw = lin_model.predict(X_input)[0]
             model_used = "Linear Regression"
         else:
             X_scaled = mlp_scaler.transform(X_input)
-            base_energy = mlp_model.predict(X_scaled)[0]
+            base_energy_raw = mlp_model.predict(X_scaled)[0]
             model_used = "MLPRegressor"
 
-        base_energy = max(0.0, float(base_energy))
+        # --- NEW: enforce non-negative (or a small physical lower-bound) ---
+        MIN_ENERGY = 0.1  # or use the true min from your dataset
+        base_energy = float(base_energy_raw)
+        base_energy = max(MIN_ENERGY, base_energy)
 
         # Baseline reference configuration (e.g., 8 layers, 6h, 120 GFLOPs/h)
         baseline_X = np.array([[8, 6.0, 120.0]])
+
+        # ✅ Again: no scaling for LinearRegression
         baseline_energy = lin_model.predict(baseline_X)[0]
         baseline_energy = max(0.0, float(baseline_energy))
 
         # -------- 7.2 Original prompt complexity & energy --------
         orig_tokens, orig_lines, orig_complexity = compute_prompt_features(prompt_text)
-        orig_scale = prompt_scaling_factor(orig_tokens)
-        orig_total_energy = base_energy * orig_scale
-        orig_overhead = orig_total_energy - base_energy  # how much extra due to prompt
+
+        # NEW: additive overhead in kWh based on tokens & complexity
+        orig_overhead = prompt_overhead_kwh(orig_tokens, orig_complexity)
+        orig_total_energy = base_energy + orig_overhead
 
         # -------- 7.3 Recommended simpler prompt --------
         improved_prompt = suggest_simpler_prompt(prompt_text)
         imp_tokens, imp_lines, imp_complexity = compute_prompt_features(improved_prompt)
-        imp_scale = prompt_scaling_factor(imp_tokens)
-        imp_total_energy = base_energy * imp_scale
-        imp_overhead = imp_total_energy - base_energy
+
+        imp_overhead = prompt_overhead_kwh(imp_tokens, imp_complexity)
+        imp_total_energy = base_energy + imp_overhead
 
         saving_kwh = orig_total_energy - imp_total_energy
 
@@ -446,6 +556,28 @@ with col_right:
         )
 
         st.markdown(f"*Base model used for estimation: **{model_used}***")
+
+ # -------- 7.4-bis Anomaly detection (IsolationForest) --------
+        try:
+            iso_model = load_iso_model(MODELS_DIR)
+
+            status_text, status_color, iso_score = classify_anomaly(
+                num_layers=num_layers,
+                training_hours=training_hours,
+                flops_per_hour=flops_per_hour,
+                base_energy=base_energy,
+                iso_model=iso_model,
+                score_threshold_warn=-0.53,  # you can tune this
+            )
+
+            st.markdown(
+                f"**Anomaly status (IsolationForest):** "
+                f"<span style='color:{status_color}; font-weight:bold;'>{status_text}</span> "
+                f"(score = {iso_score:.3f})",
+                unsafe_allow_html=True,
+            )
+        except Exception as e:
+            st.info(f"Could not compute anomaly status: {e}")
 
         # -------- 7.5 Comparison table --------
         comparison_df = pd.DataFrame(
@@ -504,7 +636,7 @@ with col_right:
                     )
                         # -------- 7.6 Model visualisation + prompt-specific markers --------
         try:
-            data_path = Path("data/energy_synthetic.csv")
+            data_path = Path("data/energy_synthetic_structured.csv")
             df_energy = load_energy_data(data_path)
 
             # Common: features and actual target from synthetic dataset
