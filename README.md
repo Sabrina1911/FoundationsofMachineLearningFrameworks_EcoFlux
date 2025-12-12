@@ -21,12 +21,12 @@ MLF_MVP/
 ├── app.py # Streamlit GUI (final application)
 │
 ├── data/
-│ └── energy_synthetic.csv # Auto-generated synthetic dataset
-│
+│ ├── energy_synthetic.csv # Auto-generated synthetic dataset
+│ └── energy_synthetic_structured.csv
 ├── models/
 │ ├── ecoflux_linear_regression.pkl
-│ └── ecoflux_mlp_regressor.pkl
-│
+│ ├── ecoflux_mlp_regressor.pkl
+│ └── ecoflux_iso_forest.pkl
 ├── notebooks/
 │ └── SustainableAI_FinalProjectProtocol.ipynb
 │
@@ -96,10 +96,10 @@ python train_models.py
 
 ## Model Performance
 
-| Model             | MAE   | MSE   | RMSE  | R²    | Notes                                                  |
-|------------------|-------|-------|-------|-------|--------------------------------------------------------|
-| Linear Regression | 0.696 | 0.643 | 0.802 | 0.441 | Best performing model; stable & interpretable          |
-| MLPRegressor      | 0.725 | 1.081 | 1.040 | 0.060 | Underperforms due to small dataset; slight overfitting |
+| Model             | MAE   | RMSE  | R²    | Notes                                                  |
+|------------------|-------|-------|-------|--------------------------------------------------------|
+| Linear Regression | 4.278 | 5.506 | 0.796 | Good performance but not enough to explain with simple linear line  |
+| MLPRegressor      | 1.218 | 1.550 | 0.984 | Best performing model |
 
 **Conclusion:**  
 Linear Regression is the recommended default model for EcoFlux.
